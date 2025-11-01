@@ -1,0 +1,188 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>ESP32 Datalog BLE Viewer</title>
+  <style>
+    body { font-family: Arial, Helvetica, sans-serif; margin: 12px; background: #f8f8f8; }
+    #log { height:400px ; border: 1px solid #ccc; padding: 8px; overflow-y: auto; background: #fff; }
+    button { padding:8px 12px; margin-right: 8px; cursor:pointer; }
+    input[type=text] { padding:6px; width: 300px; }
+    pre { margin: 0; font-family: Arial; font-size: 23px; }
+
+    pre {
+      display: inline;             /* prevents line break after Rx: */
+      margin: 0;
+      font-family: "Consolas", monospace;
+      font-size: 17px;
+      white-space: pre-wrap;
+    }
+
+    h2 { margin-top: 0; }
+  </style>
+</head>
+<body>
+  <h2>ESP32 Datalog BLE Viewer</h2>
+
+  <div>
+    <button id="bleConnectButton">Connect BLE</button>
+    <button id="btnGetLast">Get Last Reading</button>
+    <button id="btnRecent5">Get Recent 5</button>
+    <button id="btnListFiles">List Files</button>
+    <!--<button id="btnDownload">Download Datalog.csv</button>-->
+  </div>
+
+  <div style="margin-top:8px;">
+    <input id="cmdInput" type="text" placeholder="raw command (e.g. get_file:datalog.csv)">
+    <button id="sendCmd">Send</button>
+  </div>
+
+  <h3>Log</h3>
+  <div id="log"></div>
+
+  <script>
+    const BLE_SERVICE_UUID  = "00948910-1cef-4307-86f6-b97aff6b26c5";
+    const CMD_CHAR_UUID     = "1afd03b2-83f0-4189-9793-f1b44a350de0";
+    const STATUS_CHAR_UUID  = "42e2cbf0-9c82-4519-b502-eb683d14a3d6";
+
+    let device = null, server = null, cmdChar = null, statusChar = null;
+    let fileChunks = [], fileInfo = {};
+
+    const logEl = document.getElementById('log');
+    function log(msg) {
+      const line = `<div>${new Date().toLocaleTimeString()} — ${msg}</div>`;
+      logEl.insertAdjacentHTML('beforeend', line);
+      logEl.scrollTop = logEl.scrollHeight;
+    }
+
+    async function connectBLE() {
+      try {
+        log('Requesting BLE device...');
+        device = await navigator.bluetooth.requestDevice({
+          filters: [{ services: [BLE_SERVICE_UUID] }],
+          optionalServices: [BLE_SERVICE_UUID]
+        });
+
+        device.addEventListener('gattserverdisconnected', onDisconnected);
+        log('Connecting to GATT server...');
+        server = await device.gatt.connect();
+
+        const service = await server.getPrimaryService(BLE_SERVICE_UUID);
+        cmdChar = await service.getCharacteristic(CMD_CHAR_UUID);
+        statusChar = await service.getCharacteristic(STATUS_CHAR_UUID);
+
+        await statusChar.startNotifications();
+        statusChar.addEventListener('characteristicvaluechanged', onStatus);
+
+        log('✅ Connected. Listening for notifications...');
+      } catch (err) {
+        log('❌ BLE Error: ' + err.message);
+      }
+    }
+
+    function onDisconnected() {
+      log('⚠️ Device disconnected.');
+      device = null;
+      server = null;
+      cmdChar = null;
+      statusChar = null;
+    }
+
+    function onStatus(event) {
+      const value = event.target.value;
+      const decoder = new TextDecoder('utf-8');
+      const text = decoder.decode(value);
+
+      try {
+        const obj = JSON.parse(text);
+        switch (obj.type) {
+          case 'sensor_update':
+          case 'warming':
+            if (obj.gas_res) delete obj.gas_res;
+            // Remove first newline and keep JSON inline with "Rx:"
+            const formatted = JSON.stringify(obj, null, 2).replace(/^\n/, '');
+            log(`Rx: <pre>${formatted}</pre>`);
+            break;
+
+          case 'last_reading':
+          case 'recent_readings':
+            log(`RX (${obj.type}): <pre>${obj.data.replace(/\\n/g, '<br>')}</pre>`);
+            break;
+
+          case 'file_list':
+            log(`RX (Files): ${obj.files}`);
+            break;
+
+          case 'file_start':
+            fileInfo = { name: obj.filename, size: obj.size };
+            fileChunks = [];
+            log(`⬇️ Starting download for <strong>${fileInfo.name}</strong> (${fileInfo.size} bytes)...`);
+            break;
+
+          case 'file_data':
+            fileChunks.push(obj.data);
+            const received = fileChunks.reduce((a, c) => a + c.length, 0);
+            const percent = ((received / fileInfo.size) * 100).toFixed(1);
+            log(`... receiving chunk... ${percent}%`);
+            break;
+
+          case 'file_end':
+            log(`✅ Download complete for <strong>${fileInfo.name}</strong>.`);
+            triggerDownload();
+            break;
+
+          case 'error':
+            log(`❌ ERROR: ${obj.message}`);
+            break;
+
+          default:
+            log('RX (unknown type): ' + text);
+        }
+      } catch (e) {
+        log('Rx: ' + text); // Non-JSON
+      }
+    }
+
+    function triggerDownload() {
+      if (fileChunks.length === 0) {
+        log('No file data to save.');
+        return;
+      }
+      const fileContent = fileChunks.join('');
+      const blob = new Blob([fileContent], { type: 'text/csv;charset=utf-8;' });
+      const link = document.createElement('a');
+      const url = URL.createObjectURL(blob);
+      link.href = url;
+      link.download = fileInfo.name;
+      document.body.appendChild(link);
+      link.click();
+      document.body.removeChild(link);
+
+      fileChunks = [];
+      fileInfo = {};
+    }
+
+    async function sendCommand(cmd) {
+      if (!cmdChar) { log('Not connected'); return; }
+      const encoder = new TextEncoder();
+      try {
+        await cmdChar.writeValue(encoder.encode(cmd));
+        log('➡️ Sent: ' + cmd);
+      } catch (err) {
+        log('Send error: ' + err.message);
+      }
+    }
+
+    document.getElementById('bleConnectButton').addEventListener('click', connectBLE);
+    document.getElementById('btnGetLast').addEventListener('click', () => sendCommand('get_last'));
+    document.getElementById('btnRecent5').addEventListener('click', () => sendCommand('get_recent:5'));
+    document.getElementById('btnListFiles').addEventListener('click', () => sendCommand('list_files'));
+    document.getElementById('btnDownload').addEventListener('click', () => sendCommand('get_file:datalog.csv'));
+    document.getElementById('sendCmd').addEventListener('click', () => {
+      const v = document.getElementById('cmdInput').value.trim();
+      if (v.length) sendCommand(v);
+    });
+  </script>
+</body>
+</html>
